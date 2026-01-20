@@ -20,6 +20,8 @@ require 'open3'
 require 'yaml'
 require 'optparse'
 require 'fileutils'
+require 'cgi'
+require 'shellwords'
 
 # --- Configuration Management ---
 
@@ -125,26 +127,37 @@ def run_git_cmd(cmd, dir)
 end
 
 def check_pair(dir, upstream, downstream, excludes)
-  # 1. Check if branches exist
-  up_sha, up_ok = run_git_cmd("git rev-parse --verify --quiet #{upstream}", dir)
-  down_sha, down_ok = run_git_cmd("git rev-parse --verify --quiet #{downstream}", dir)
+  # Escape arguments
+  safe_up = Shellwords.escape(upstream)
+  safe_down = Shellwords.escape(downstream)
+  safe_excludes = excludes.map { |e| Shellwords.escape(e) }.join(' ')
 
-  return 'missing' unless up_ok && down_ok
+  # 1. Check if branches exist
+  up_sha, up_ok = run_git_cmd("git rev-parse --verify --quiet #{safe_up}", dir)
+  down_sha, down_ok = run_git_cmd("git rev-parse --verify --quiet #{safe_down}", dir)
+
+  return { :status => 'missing' } unless up_ok && down_ok
 
   # 2. Check Content (git diff)
-  diff_cmd = "git diff --quiet #{upstream} #{downstream} -- #{excludes.join(' ')}"
+  diff_cmd = "git diff --quiet #{safe_up} #{safe_down} -- #{safe_excludes}"
   _, synced = run_git_cmd(diff_cmd, dir)
   
-  return 'synced' if synced
+  return { :status => 'synced' } if synced
 
   # 3. Ancestry Check
-  _, merged = run_git_cmd("git merge-base --is-ancestor #{upstream} #{downstream}", dir)
-  return 'merged' if merged
+  _, merged = run_git_cmd("git merge-base --is-ancestor #{safe_up} #{safe_down}", dir)
+  return { :status => 'merged' } if merged
 
-  _, behind = run_git_cmd("git merge-base --is-ancestor #{downstream} #{upstream}", dir)
-  return 'behind' if behind
-
-  return 'diverged'
+  _, behind = run_git_cmd("git merge-base --is-ancestor #{safe_down} #{safe_up}", dir)
+  
+  # For behind or diverged, get the diff (show what is in upstream vs downstream)
+  diff_out, _ = run_git_cmd("git diff #{safe_down} #{safe_up} -- #{safe_excludes}", dir)
+  
+  if behind
+    return { :status => 'behind', :diff => diff_out }
+  else
+    return { :status => 'diverged', :diff => diff_out }
+  end
 end
 
 def process_repo(repo_path, stages, excludes)
@@ -207,10 +220,57 @@ def generate_html(modules, stages, config)
           font-size: 14px;
           font-weight: 500;
         }
+        .clickable {
+          cursor: pointer;
+          text-decoration: underline;
+        }
         .dimmed {
           opacity: 0.25;
           filter: grayscale(100%);
           background-color: #e5e7eb;
+        }
+        .modal {
+          display: none; 
+          position: fixed; 
+          z-index: 1000; 
+          left: 0;
+          top: 0;
+          width: 100%; 
+          height: 100%; 
+          overflow: auto; 
+          background-color: rgba(0,0,0,0.4); 
+        }
+        .modal-content {
+          background-color: #fefefe;
+          margin: 5% auto; 
+          padding: 20px;
+          border: 1px solid #888;
+          width: 80%; 
+          max-width: 1200px;
+          border-radius: 8px;
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        .close {
+          color: #aaa;
+          float: right;
+          font-size: 28px;
+          font-weight: bold;
+          cursor: pointer;
+        }
+        .close:hover,
+        .close:focus {
+          color: black;
+          text-decoration: none;
+          cursor: pointer;
+        }
+        pre {
+          background: #f3f4f6;
+          padding: 15px;
+          border-radius: 4px;
+          overflow-x: auto;
+          white-space: pre-wrap;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          font-size: 12px;
         }
       </style>
     </head>
@@ -235,25 +295,67 @@ def generate_html(modules, stages, config)
           </tr>
         </thead>
         <tbody>
-          <% modules.each do |mod| %>
+          <% modules.each_with_index do |mod, row_idx| %>
             <tr>
               <td><strong><%= mod.name %></strong></td>
               <% is_dimmed = false %>
-              <% mod.statuses.each do |status| %>
+              <% mod.statuses.each_with_index do |st_obj, col_idx| %>
+                <% 
+                   status = st_obj[:status]
+                   diff = st_obj[:diff]
+                   status_str = status.to_s
+                %>
                 <td<%= ' class="dimmed"' if is_dimmed %>>
-                  <span class="status-badge" style="background-color: <%= colors[status] %>">
-                    <%= STATUS_LABELS[status] || status.capitalize %>
-                  </span>
+                  <% if diff && !diff.empty? %>
+                    <span class="status-badge clickable" 
+                          style="background-color: <%= colors[status_str] %>"
+                          onclick="openModal('diff-<%= row_idx %>-<%= col_idx %>')">
+                      <%= STATUS_LABELS[status_str] || status_str.capitalize %>
+                    </span>
+                    <div id="diff-<%= row_idx %>-<%= col_idx %>" style="display:none"><%= CGI.escapeHTML(diff) %></div>
+                  <% else %>
+                    <span class="status-badge" style="background-color: <%= colors[status_str] %>">
+                      <%= STATUS_LABELS[status_str] || status_str.capitalize %>
+                    </span>
+                  <% end %>
                 </td>
                 <% 
-                   is_dimmed = true if ['behind', 'diverged', 'error'].include?(status) 
+                   is_dimmed = true if ['behind', 'diverged', 'error'].include?(status_str) 
                 %>
               <% end %>
             </tr>
           <% end %>
         </tbody>
       </table>
+
+      <div id="diffModal" class="modal">
+        <div class="modal-content">
+          <span class="close" onclick="closeModal()">&times;</span>
+          <h3>Git Diff</h3>
+          <pre id="modalText"></pre>
+        </div>
+      </div>
+
       <script>
+        const modal = document.getElementById("diffModal");
+        const modalText = document.getElementById("modalText");
+
+        function openModal(elementId) {
+          const diffContent = document.getElementById(elementId).textContent;
+          modalText.textContent = diffContent;
+          modal.style.display = "block";
+        }
+
+        function closeModal() {
+          modal.style.display = "none";
+        }
+
+        window.onclick = function(event) {
+          if (event.target == modal) {
+            modal.style.display = "none";
+          }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
           const table = document.querySelector('table');
           const tbody = table.querySelector('tbody');
