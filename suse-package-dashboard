@@ -367,6 +367,7 @@ def generate_html(modules, stages, config, context_id)
                           data-src-sha="<%= src_sha %>"
                           data-dst-sha="<%= dst_sha %>"
                           data-context-id="<%= context_id %>"
+                          data-status="<%= status_str %>"
                           onclick="openModal('badge-<%= row_idx %>-<%= col_idx %>', 'diff-<%= row_idx %>-<%= col_idx %>')">
                       <%= STATUS_LABELS[status_str] || status_str.capitalize %>
                     </span>
@@ -395,13 +396,14 @@ def generate_html(modules, stages, config, context_id)
           <pre id="modalText"></pre>
           <div class="modal-footer">
             <button class="btn btn-primary" onclick="ignoreDiff()">Ignore diff</button>
-            <button class="btn btn-secondary" onclick="closeModal()">Ack diff</button>
+            <button class="btn btn-secondary" onclick="ackDiff()">Ack diff</button>
           </div>
         </div>
       </div>
 
       <script>
         const STATUS_COLORS = <%= config['status_colors'].to_json %>;
+        const STATUS_LABELS = <%= STATUS_LABELS.to_json %>;
         const CONTEXT_ID = "<%= context_id %>";
         const modal = document.getElementById("diffModal");
         const modalText = document.getElementById("modalText");
@@ -422,7 +424,6 @@ def generate_html(modules, stages, config, context_id)
         function applyIgnoredState(badge) {
           badge.classList.add('ignored');
           badge.textContent = 'Ignored';
-          // We keep onclick as requested
         }
 
         function ignoreDiff() {
@@ -430,19 +431,33 @@ def generate_html(modules, stages, config, context_id)
           
           const badge = document.getElementById(currentBadgeId);
           if (badge) {
-            // Save to LocalStorage
             const key = `ignore_${badge.dataset.contextId}_${badge.dataset.project}_${badge.dataset.srcSha}_${badge.dataset.dstSha}`;
             localStorage.setItem(key, 'true');
-
-            // Update UI
             applyIgnoredState(badge);
             
+            const tr = badge.closest('tr');
+            if (tr) updateRowDimming(tr);
+          }
+          closeModal();
+        }
+
+        function ackDiff() {
+          if (!currentBadgeId) return;
+          
+          const badge = document.getElementById(currentBadgeId);
+          if (badge) {
+            // Remove from LocalStorage
+            const key = `ignore_${badge.dataset.contextId}_${badge.dataset.project}_${badge.dataset.srcSha}_${badge.dataset.dstSha}`;
+            localStorage.removeItem(key);
+
+            // Revert UI
+            badge.classList.remove('ignored');
+            const status = badge.dataset.status;
+            badge.textContent = STATUS_LABELS[status] || status;
+            
             // Re-evaluate dimming for this row
-            const td = badge.closest('td');
-            const tr = td.closest('tr');
-            if (tr) {
-              updateRowDimming(tr);
-            }
+            const tr = badge.closest('tr');
+            if (tr) updateRowDimming(tr);
           }
           closeModal();
         }
@@ -467,16 +482,12 @@ def generate_html(modules, stages, config, context_id)
 
           badges.forEach(badge => {
             const td = badge.closest('td');
-            // Apply current dimmed state
             if (isDimmed) {
               td.classList.add('dimmed');
             } else {
               td.classList.remove('dimmed');
             }
 
-            // Determine if NEXT cells should be dimmed
-            // If ignored, treat as good (synced), so DO NOT DIM next cells based on this.
-            // If not ignored and status is bad, DIM next cells.
             const isIgnored = badge.classList.contains('ignored');
             const statusText = badge.textContent.trim().toLowerCase();
             
@@ -487,9 +498,7 @@ def generate_html(modules, stages, config, context_id)
         }
 
         window.onclick = function(event) {
-          if (event.target == modal) {
-            closeModal();
-          }
+          if (event.target == modal) closeModal();
         }
 
         window.addEventListener('keydown', function(event) {
@@ -504,7 +513,6 @@ def generate_html(modules, stages, config, context_id)
         });
 
         document.addEventListener('DOMContentLoaded', () => {
-          // 1. Restore Ignored States
           const badges = document.querySelectorAll('.status-badge[data-src-sha]');
           badges.forEach(badge => {
             const key = `ignore_${badge.dataset.contextId}_${badge.dataset.project}_${badge.dataset.srcSha}_${badge.dataset.dstSha}`;
@@ -513,17 +521,12 @@ def generate_html(modules, stages, config, context_id)
             }
           });
 
-          // 2. Initial Row Dimming
-          const table = document.querySelector('table');
-          const tbody = table.querySelector('tbody');
+          const tbody = document.querySelector('table tbody');
           const rows = Array.from(tbody.querySelectorAll('tr'));
-          
           rows.forEach(row => updateRowDimming(row));
 
-          // 3. Search/Filter Logic
           const searchInput = document.getElementById('searchInput');
           const hideMergedCheckbox = document.getElementById('hideMerged');
-          const headers = table.querySelectorAll('th');
 
           function filterRows() {
             const term = searchInput.value.toLowerCase();
@@ -532,24 +535,15 @@ def generate_html(modules, stages, config, context_id)
             rows.forEach(row => {
               const name = row.cells[0].textContent.toLowerCase();
               const matchesSearch = name.includes(term);
-
               const badges = Array.from(row.querySelectorAll('.status-badge'));
-              const statuses = badges.map(b => b.textContent.trim().toLowerCase());
-              
-              // Bad statuses: behind, diverged, error BUT NOT Ignored
               const hasIssue = badges.some(b => {
                 const s = b.textContent.trim().toLowerCase();
                 const isIgnored = b.classList.contains('ignored');
                 return !isIgnored && ['behind', 'diverged', 'error'].includes(s);
               });
               
-              const isAllMerged = !hasIssue;
-
               let visible = matchesSearch;
-              if (hideMerged && isAllMerged) {
-                visible = false;
-              }
-
+              if (hideMerged && !hasIssue) visible = false;
               row.style.display = visible ? '' : 'none';
             });
           }
@@ -557,22 +551,13 @@ def generate_html(modules, stages, config, context_id)
           searchInput.addEventListener('input', filterRows);
           hideMergedCheckbox.addEventListener('change', filterRows);
 
-          headers.forEach((th, index) => {
+          document.querySelectorAll('th').forEach((th, index) => {
             th.style.cursor = 'pointer';
-            th.title = "Click to sort";
             th.addEventListener('click', () => {
               const currentRows = Array.from(tbody.querySelectorAll('tr'));
               const multiplier = th.dataset.order === 'asc' ? -1 : 1;
               th.dataset.order = th.dataset.order === 'asc' ? 'desc' : 'asc';
-              
-              headers.forEach(h => { if(h !== th) h.dataset.order = ''; });
-
-              currentRows.sort((a, b) => {
-                const aCell = a.cells[index].textContent.trim();
-                const bCell = b.cells[index].textContent.trim();
-                return aCell.localeCompare(bCell) * multiplier;
-              });
-
+              currentRows.sort((a, b) => a.cells[index].textContent.trim().localeCompare(b.cells[index].textContent.trim()) * multiplier);
               tbody.append(...currentRows);
             });
           });
