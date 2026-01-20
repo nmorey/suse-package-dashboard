@@ -448,6 +448,17 @@ def generate_html(modules, stages, config)
           }
         }
 
+        window.addEventListener('keydown', function(event) {
+          if (modal.style.display === "block") {
+            if (event.key.toLowerCase() === 'i') {
+              ignoreDiff();
+              event.preventDefault();
+            } else if (event.key === 'Escape') {
+              closeModal();
+            }
+          }
+        });
+
         document.addEventListener('DOMContentLoaded', () => {
           const table = document.querySelector('table');
           const tbody = table.querySelector('tbody');
