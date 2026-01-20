@@ -23,6 +23,7 @@ require 'fileutils'
 require 'cgi'
 require 'shellwords'
 require 'json'
+require 'digest'
 
 # --- Configuration Management ---
 
@@ -139,15 +140,17 @@ def check_pair(dir, upstream, downstream, excludes)
 
   return { :status => 'missing' } unless up_ok && down_ok
 
+  base_result = { :src_sha => up_sha, :dst_sha => down_sha }
+
   # 2. Check Content (git diff)
   diff_cmd = "git diff --quiet #{safe_up} #{safe_down} -- #{safe_excludes}"
   _, synced = run_git_cmd(diff_cmd, dir)
   
-  return { :status => 'synced' } if synced
+  return base_result.merge({ :status => 'synced' }) if synced
 
   # 3. Ancestry Check
   _, merged = run_git_cmd("git merge-base --is-ancestor #{safe_up} #{safe_down}", dir)
-  return { :status => 'merged' } if merged
+  return base_result.merge({ :status => 'merged' }) if merged
 
   _, behind = run_git_cmd("git merge-base --is-ancestor #{safe_down} #{safe_up}", dir)
   
@@ -155,9 +158,9 @@ def check_pair(dir, upstream, downstream, excludes)
   diff_out, _ = run_git_cmd("git diff #{safe_down} #{safe_up} -- #{safe_excludes}", dir)
   
   if behind
-    return { :status => 'behind', :diff => diff_out }
+    return base_result.merge({ :status => 'behind', :diff => diff_out })
   else
-    return { :status => 'diverged', :diff => diff_out }
+    return base_result.merge({ :status => 'diverged', :diff => diff_out })
   end
 end
 
@@ -201,7 +204,7 @@ end
 
 # --- HTML Generation ---
 
-def generate_html(modules, stages, config)
+def generate_html(modules, stages, config, context_id)
   colors = config['status_colors']
   
   template = <<~ERB
@@ -220,6 +223,11 @@ def generate_html(modules, stages, config)
           border-radius: 9999px;
           font-size: 14px;
           font-weight: 500;
+        }
+        .status-badge.ignored {
+          background-color: #dcfce7 !important;
+          color: #166534 !important;
+          border: 2px dashed #9ca3af;
         }
         .clickable {
           cursor: pointer;
@@ -313,8 +321,13 @@ def generate_html(modules, stages, config)
       </style>
     </head>
     <body>
-      <h1>Package Update Status</h1>
-      <p>Generated at <%= Time.now %></p>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <div>
+          <h1 style="margin: 0;">Package Update Status</h1>
+          <p style="margin: 5px 0 0 0; color: #6b7280;">Generated at <%= Time.now %></p>
+        </div>
+        <button class="btn btn-secondary" onclick="resetIgnored()">Reset Ignored Diffs</button>
+      </div>
 
       <div style="margin-bottom: 20px; display: flex; gap: 20px; align-items: center;">
         <input type="text" id="searchInput" placeholder="Search modules..." style="padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; width: 300px;">
@@ -341,6 +354,8 @@ def generate_html(modules, stages, config)
                 <% 
                    status = st_obj[:status]
                    diff = st_obj[:diff]
+                   src_sha = st_obj[:src_sha]
+                   dst_sha = st_obj[:dst_sha]
                    status_str = status.to_s
                 %>
                 <td<%= ' class="dimmed"' if is_dimmed %>>
@@ -348,6 +363,10 @@ def generate_html(modules, stages, config)
                     <span id="badge-<%= row_idx %>-<%= col_idx %>" 
                           class="status-badge clickable" 
                           style="background-color: <%= colors[status_str] %>"
+                          data-project="<%= mod.name %>"
+                          data-src-sha="<%= src_sha %>"
+                          data-dst-sha="<%= dst_sha %>"
+                          data-context-id="<%= context_id %>"
                           onclick="openModal('badge-<%= row_idx %>-<%= col_idx %>', 'diff-<%= row_idx %>-<%= col_idx %>')">
                       <%= STATUS_LABELS[status_str] || status_str.capitalize %>
                     </span>
@@ -383,6 +402,7 @@ def generate_html(modules, stages, config)
 
       <script>
         const STATUS_COLORS = <%= config['status_colors'].to_json %>;
+        const CONTEXT_ID = "<%= context_id %>";
         const modal = document.getElementById("diffModal");
         const modalText = document.getElementById("modalText");
         let currentBadgeId = null;
@@ -399,19 +419,25 @@ def generate_html(modules, stages, config)
           currentBadgeId = null;
         }
 
+        function applyIgnoredState(badge) {
+          badge.classList.add('ignored');
+          badge.textContent = 'Ignored';
+          // We keep onclick as requested
+        }
+
         function ignoreDiff() {
           if (!currentBadgeId) return;
           
           const badge = document.getElementById(currentBadgeId);
           if (badge) {
-            // Update badge to Synced
-            badge.textContent = 'Synced';
-            badge.style.backgroundColor = STATUS_COLORS['synced'];
-            badge.classList.remove('clickable');
-            badge.removeAttribute('onclick');
+            // Save to LocalStorage
+            const key = `ignore_${badge.dataset.contextId}_${badge.dataset.project}_${badge.dataset.srcSha}_${badge.dataset.dstSha}`;
+            localStorage.setItem(key, 'true');
+
+            // Update UI
+            applyIgnoredState(badge);
             
             // Re-evaluate dimming for this row
-            // Find the parent TR
             const td = badge.closest('td');
             const tr = td.closest('tr');
             if (tr) {
@@ -419,6 +445,20 @@ def generate_html(modules, stages, config)
             }
           }
           closeModal();
+        }
+
+        function resetIgnored() {
+          if(!confirm("Reset all ignored diffs for this view?")) return;
+          
+          const keysToRemove = [];
+          for(let i=0; i<localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if(key.startsWith(`ignore_${CONTEXT_ID}_`)) {
+              keysToRemove.push(key);
+            }
+          }
+          keysToRemove.forEach(k => localStorage.removeItem(k));
+          location.reload();
         }
 
         function updateRowDimming(tr) {
@@ -435,8 +475,12 @@ def generate_html(modules, stages, config)
             }
 
             // Determine if NEXT cells should be dimmed
+            // If ignored, treat as good (synced), so DO NOT DIM next cells based on this.
+            // If not ignored and status is bad, DIM next cells.
+            const isIgnored = badge.classList.contains('ignored');
             const statusText = badge.textContent.trim().toLowerCase();
-            if (['behind', 'diverged', 'error'].includes(statusText)) {
+            
+            if (!isIgnored && ['behind', 'diverged', 'error'].includes(statusText)) {
               isDimmed = true;
             }
           });
@@ -460,9 +504,23 @@ def generate_html(modules, stages, config)
         });
 
         document.addEventListener('DOMContentLoaded', () => {
+          // 1. Restore Ignored States
+          const badges = document.querySelectorAll('.status-badge[data-src-sha]');
+          badges.forEach(badge => {
+            const key = `ignore_${badge.dataset.contextId}_${badge.dataset.project}_${badge.dataset.srcSha}_${badge.dataset.dstSha}`;
+            if (localStorage.getItem(key) === 'true') {
+               applyIgnoredState(badge);
+            }
+          });
+
+          // 2. Initial Row Dimming
           const table = document.querySelector('table');
           const tbody = table.querySelector('tbody');
           const rows = Array.from(tbody.querySelectorAll('tr'));
+          
+          rows.forEach(row => updateRowDimming(row));
+
+          // 3. Search/Filter Logic
           const searchInput = document.getElementById('searchInput');
           const hideMergedCheckbox = document.getElementById('hideMerged');
           const headers = table.querySelectorAll('th');
@@ -477,8 +535,14 @@ def generate_html(modules, stages, config)
 
               const badges = Array.from(row.querySelectorAll('.status-badge'));
               const statuses = badges.map(b => b.textContent.trim().toLowerCase());
-              // Bad statuses: behind, diverged, error
-              const hasIssue = statuses.some(s => ['behind', 'diverged', 'error'].includes(s));
+              
+              // Bad statuses: behind, diverged, error BUT NOT Ignored
+              const hasIssue = badges.some(b => {
+                const s = b.textContent.trim().toLowerCase();
+                const isIgnored = b.classList.contains('ignored');
+                return !isIgnored && ['behind', 'diverged', 'error'].includes(s);
+              });
+              
               const isAllMerged = !hasIssue;
 
               let visible = matchesSearch;
@@ -625,8 +689,9 @@ if all_modules.empty?
   exit 0
 end
 
+context_id = Digest::SHA256.hexdigest(flow_name + repo_paths.sort.join)
 output_file = File.expand_path($options[:output])
-File.write(output_file, generate_html(all_modules, stages, config))
+File.write(output_file, generate_html(all_modules, stages, config, context_id))
 log_info "Dashboard generated at: #{output_file}"
 
 if $options[:open] || config['open_by_default']
