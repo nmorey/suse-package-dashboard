@@ -1,0 +1,429 @@
+#!/usr/bin/env ruby
+
+# Copyright (C) 2026 SUSE LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+require 'erb'
+require 'open3'
+require 'yaml'
+require 'optparse'
+require 'fileutils'
+
+# --- Configuration Management ---
+
+DEFAULT_CONFIG = {
+  'flows' => {
+    'default' => [
+      'private/main',
+      'devel/main',
+      'origin/factory',
+      'suse-private/slfo-main',
+      'sle/slfo-main'
+    ]
+  },
+  'default_flow' => 'default',
+  'open_by_default' => false,
+  'repos' => ['.'],
+  'excludes' => [
+    ':(exclude)README.md',
+    ':(exclude)_scmsync.obsinfo',
+    ':(exclude)build.specials.obscpio'
+  ],
+  'status_colors' => {
+    'synced' => '#dcfce7', # Green-100
+    'merged' => '#ecfccb', # Lime-100
+    'behind' => '#fee2e2', # Red-100
+    'diverged' => '#ffedd5', # Orange-100
+    'missing' => '#f3f4f6', # Gray-100
+    'error' => '#f3f4f6'    # Gray-100
+  }
+}
+
+STATUS_LABELS = {
+  'synced' => 'Synced',
+  'merged' => 'Merged',
+  'behind' => 'Behind',
+  'diverged' => 'Diverged',
+  'missing' => 'Missing',
+  'error' => 'Error'
+}
+
+# Global options will be set during CLI parsing
+$options = {}
+
+def log_info(msg)
+  puts msg unless $options[:quiet]
+end
+
+def load_config
+  config_home = ENV['XDG_CONFIG_HOME'] || File.join(Dir.home, '.config')
+  config_path = File.join(config_home, 'suse-dashboard.yaml')
+
+  if File.exist?(config_path)
+    user_config = YAML.load_file(config_path)
+    
+    # Simple migration: if old config has 'stages' but no 'flows', convert it
+    if user_config['stages'] && !user_config['flows']
+      user_config['flows'] = { 'default' => user_config['stages'] }
+      user_config['default_flow'] ||= 'default'
+      user_config.delete('stages')
+    end
+
+    config = DEFAULT_CONFIG.merge(user_config || {})
+    # Ensure nested keys are merged correctly if missing in user config
+    config['flows'] = DEFAULT_CONFIG['flows'].merge(config['flows'] || {})
+    
+    # Check if we need to update the file with new defaults (e.g. open_by_default)
+    if config.keys.any? { |k| !user_config.key?(k) }
+      save_config(config)
+    end
+    
+    config
+  else
+    FileUtils.mkdir_p(File.dirname(config_path))
+    File.write(config_path, DEFAULT_CONFIG.to_yaml)
+    log_info "Created default configuration at: #{config_path}"
+    DEFAULT_CONFIG
+  end
+end
+
+def save_config(config)
+  config_home = ENV['XDG_CONFIG_HOME'] || File.join(Dir.home, '.config')
+  config_path = File.join(config_home, 'suse-dashboard.yaml')
+  File.write(config_path, config.to_yaml)
+  log_info "Configuration saved to: #{config_path}"
+end
+
+# --- Data Structures ---
+
+class ModuleStatus
+  attr_accessor :name, :statuses
+
+  def initialize(name)
+    @name = name
+    @statuses = []
+  end
+end
+
+# --- Git Operations ---
+
+def run_git_cmd(cmd, dir)
+  stdout, stderr, status = Open3.capture3(cmd, chdir: dir)
+  return stdout.strip, status.success?
+end
+
+def check_pair(dir, upstream, downstream, excludes)
+  # 1. Check if branches exist
+  up_sha, up_ok = run_git_cmd("git rev-parse --verify --quiet #{upstream}", dir)
+  down_sha, down_ok = run_git_cmd("git rev-parse --verify --quiet #{downstream}", dir)
+
+  return 'missing' unless up_ok && down_ok
+
+  # 2. Check Content (git diff)
+  diff_cmd = "git diff --quiet #{upstream} #{downstream} -- #{excludes.join(' ')}"
+  _, synced = run_git_cmd(diff_cmd, dir)
+  
+  return 'synced' if synced
+
+  # 3. Ancestry Check
+  _, merged = run_git_cmd("git merge-base --is-ancestor #{upstream} #{downstream}", dir)
+  return 'merged' if merged
+
+  _, behind = run_git_cmd("git merge-base --is-ancestor #{downstream} #{upstream}", dir)
+  return 'behind' if behind
+
+  return 'diverged'
+end
+
+def process_repo(repo_path, stages, excludes)
+  repo_name = File.basename(File.expand_path(repo_path))
+  
+  # Check if it has submodules
+  submodules_raw, ok = run_git_cmd("git submodule --quiet foreach 'echo $name $path'", repo_path)
+  
+  modules = []
+
+  if ok && !submodules_raw.empty?
+    # Process submodules
+    submodules_raw.each_line do |line|
+      name, rel_path = line.strip.split(' ', 2)
+      next unless name && rel_path
+      
+      full_path = File.join(repo_path, rel_path)
+      modules << analyze_module(name, full_path, stages, excludes)
+    end
+  else
+    # Process as a standalone repo
+    modules << analyze_module(repo_name, repo_path, stages, excludes)
+  end
+
+  modules
+end
+
+def analyze_module(name, path, stages, excludes)
+  mod = ModuleStatus.new(name)
+  log_info "Processing #{name}..."
+  
+  (0...stages.length-1).each do |i|
+    src = stages[i]
+    dst = stages[i+1]
+    status = check_pair(path, src, dst, excludes)
+    mod.statuses << status
+  end
+  mod
+end
+
+# --- HTML Generation ---
+
+def generate_html(modules, stages, config)
+  colors = config['status_colors']
+  
+  template = <<~ERB
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Package Status Dashboard</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 20px; }
+        table { border-collapse: collapse; width: 100%; border: 1px solid #e5e7eb; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+        th { background-color: #f9fafb; font-weight: 600; color: #374151; }
+        .status-badge {
+          display: inline-block;
+          padding: 4px 12px;
+          border-radius: 9999px;
+          font-size: 14px;
+          font-weight: 500;
+        }
+        .dimmed {
+          opacity: 0.25;
+          filter: grayscale(100%);
+          background-color: #e5e7eb;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Package Update Status</h1>
+      <p>Generated at <%= Time.now %></p>
+
+      <div style="margin-bottom: 20px; display: flex; gap: 20px; align-items: center;">
+        <input type="text" id="searchInput" placeholder="Search modules..." style="padding: 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; width: 300px;">
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; user-select: none;">
+          <input type="checkbox" id="hideMerged"> Hide all merged/synced
+        </label>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Module</th>
+            <% (0...stages.length-1).each do |i| %>
+              <th><%= stages[i] %> &rarr; <%= stages[i+1] %></th>
+            <% end %>
+          </tr>
+        </thead>
+        <tbody>
+          <% modules.each do |mod| %>
+            <tr>
+              <td><strong><%= mod.name %></strong></td>
+              <% is_dimmed = false %>
+              <% mod.statuses.each do |status| %>
+                <td<%= ' class="dimmed"' if is_dimmed %>>
+                  <span class="status-badge" style="background-color: <%= colors[status] %>">
+                    <%= STATUS_LABELS[status] || status.capitalize %>
+                  </span>
+                </td>
+                <% 
+                   is_dimmed = true if ['behind', 'diverged', 'error'].include?(status) 
+                %>
+              <% end %>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+      <script>
+        document.addEventListener('DOMContentLoaded', () => {
+          const table = document.querySelector('table');
+          const tbody = table.querySelector('tbody');
+          const rows = Array.from(tbody.querySelectorAll('tr'));
+          const searchInput = document.getElementById('searchInput');
+          const hideMergedCheckbox = document.getElementById('hideMerged');
+          const headers = table.querySelectorAll('th');
+
+          function filterRows() {
+            const term = searchInput.value.toLowerCase();
+            const hideMerged = hideMergedCheckbox.checked;
+
+            rows.forEach(row => {
+              const name = row.cells[0].textContent.toLowerCase();
+              const matchesSearch = name.includes(term);
+
+              const badges = Array.from(row.querySelectorAll('.status-badge'));
+              const statuses = badges.map(b => b.textContent.trim().toLowerCase());
+              // Bad statuses: behind, diverged, error
+              const hasIssue = statuses.some(s => ['behind', 'diverged', 'error'].includes(s));
+              const isAllMerged = !hasIssue;
+
+              let visible = matchesSearch;
+              if (hideMerged && isAllMerged) {
+                visible = false;
+              }
+
+              row.style.display = visible ? '' : 'none';
+            });
+          }
+
+          searchInput.addEventListener('input', filterRows);
+          hideMergedCheckbox.addEventListener('change', filterRows);
+
+          headers.forEach((th, index) => {
+            th.style.cursor = 'pointer';
+            th.title = "Click to sort";
+            th.addEventListener('click', () => {
+              const currentRows = Array.from(tbody.querySelectorAll('tr'));
+              const multiplier = th.dataset.order === 'asc' ? -1 : 1;
+              th.dataset.order = th.dataset.order === 'asc' ? 'desc' : 'asc';
+              
+              headers.forEach(h => { if(h !== th) h.dataset.order = ''; });
+
+              currentRows.sort((a, b) => {
+                const aCell = a.cells[index].textContent.trim();
+                const bCell = b.cells[index].textContent.trim();
+                return aCell.localeCompare(bCell) * multiplier;
+              });
+
+              tbody.append(...currentRows);
+            });
+          });
+        });
+      </script>
+    </body>
+    </html>
+  ERB
+  ERB.new(template).result(binding)
+end
+
+# --- Main CLI ---
+
+$options = {
+  output: 'package_dashboard.html',
+  open: false,
+  flow: nil,
+  add_flow: nil,
+  quiet: false
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: package_status_dashboard [options] [REPO_PATHS...]"
+
+  opts.on("-o", "--output FILE", "Specify output HTML file (default: package_dashboard.html)") do |f|
+    $options[:output] = f
+  end
+
+  opts.on("--open", "Open the generated dashboard with xdg-open") do
+    $options[:open] = true
+  end
+
+  opts.on("-q", "--quiet", "Suppress all information messages") do
+    $options[:quiet] = true
+  end
+
+  opts.on("--flow NAME", "Select the flow to use (defaults to 'default_flow' in config)") do |name|
+    $options[:flow] = name
+  end
+
+  opts.on("--add-flow DEFINITION", "Add a new flow to config (Format: name:stage1:stage2:...)") do |definition|
+    $options[:add_flow] = definition
+  end
+
+  opts.on("-h", "--help", "Prints this help") do
+    puts opts
+    puts
+    puts "Description:"
+    puts "  This tool tracks the git sync status of packages across multiple workflow stages."
+    puts "  It supports git submodules or standalone repositories."
+    puts "  The status (synced, merged, behind, diverged) is visualized in an HTML dashboard."
+    puts
+    puts "  Configuration is stored in $XDG_CONFIG_HOME/suse-dashboard.yaml"
+    puts "  You can define multiple 'flows' (sequences of branches) in the config."
+    exit
+  end
+end.parse!
+
+config = load_config
+
+# Handle --add-flow
+if $options[:add_flow]
+  parts = $options[:add_flow].split(':')
+  if parts.length < 3
+    puts "Error: Invalid flow definition. Format must be 'name:stage1:stage2...'"
+    exit 1
+  end
+  
+  flow_name = parts.shift
+  # Remaining parts are stages
+  config['flows'][flow_name] = parts
+  save_config(config)
+  log_info "Flow '#{flow_name}' added successfully."
+  exit 0
+end
+
+# Determine flow to use
+flow_name = $options[:flow] || config['default_flow'] || 'default'
+stages = config['flows'][flow_name]
+
+unless stages
+  puts "Error: Flow '#{flow_name}' not found in configuration."
+  puts "Available flows: #{config['flows'].keys.join(', ')}"
+  exit 1
+end
+
+log_info "Using flow: '#{flow_name}' with stages: #{stages.join(' -> ')}"
+
+# Determine repositories to scan
+# 1. CLI arguments
+# 2. Configured repos
+# 3. Default to current directory (fallback if config is empty somehow)
+repo_paths = ARGV.empty? ? (config['repos'] || ['.']) : ARGV
+
+all_modules = []
+excludes = config['excludes']
+
+repo_paths.each do |path|
+  # Expand path (handles relative paths like '.')
+  full_path = File.expand_path(path)
+  unless Dir.exist?(full_path)
+    # Warnings are likely useful even in quiet mode, but strictly "no info messages" might imply this too.
+    # I'll keep warnings unless strict silence is requested. User asked for "prevents all information messages".
+    # Usually warnings/errors go to stderr. I'll print to stderr which is standard practice for tools.
+    warn "Warning: Directory not found: #{path}"
+    next
+  end
+  log_info "Scanning repository: #{path}"
+  all_modules.concat(process_repo(full_path, stages, excludes))
+end
+
+if all_modules.empty?
+  log_info "No modules found to process."
+  exit 0
+end
+
+output_file = File.expand_path($options[:output])
+File.write(output_file, generate_html(all_modules, stages, config))
+log_info "Dashboard generated at: #{output_file}"
+
+if $options[:open] || config['open_by_default']
+  system("xdg-open #{output_file}")
+end
