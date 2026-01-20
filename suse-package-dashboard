@@ -22,6 +22,7 @@ require 'optparse'
 require 'fileutils'
 require 'cgi'
 require 'shellwords'
+require 'json'
 
 # --- Configuration Management ---
 
@@ -249,13 +250,47 @@ def generate_html(modules, stages, config)
           max-width: 1200px;
           border-radius: 8px;
           box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+          display: flex;
+          flex-direction: column;
+          gap: 15px;
+        }
+        .modal-footer {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+          margin-top: 10px;
+          padding-top: 10px;
+          border-top: 1px solid #eee;
+        }
+        .btn {
+          padding: 8px 16px;
+          border: none;
+          border-radius: 4px;
+          cursor: pointer;
+          font-weight: 500;
+          font-size: 14px;
+        }
+        .btn-secondary {
+          background-color: #e5e7eb;
+          color: #374151;
+        }
+        .btn-secondary:hover {
+          background-color: #d1d5db;
+        }
+        .btn-primary {
+          background-color: #2563eb;
+          color: white;
+        }
+        .btn-primary:hover {
+          background-color: #1d4ed8;
         }
         .close {
           color: #aaa;
-          float: right;
+          align-self: flex-end;
           font-size: 28px;
           font-weight: bold;
           cursor: pointer;
+          line-height: 1;
         }
         .close:hover,
         .close:focus {
@@ -271,6 +306,9 @@ def generate_html(modules, stages, config)
           white-space: pre-wrap;
           font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
           font-size: 12px;
+          margin: 0;
+          max-height: 60vh;
+          overflow-y: auto;
         }
       </style>
     </head>
@@ -307,9 +345,10 @@ def generate_html(modules, stages, config)
                 %>
                 <td<%= ' class="dimmed"' if is_dimmed %>>
                   <% if diff && !diff.empty? %>
-                    <span class="status-badge clickable" 
+                    <span id="badge-<%= row_idx %>-<%= col_idx %>" 
+                          class="status-badge clickable" 
                           style="background-color: <%= colors[status_str] %>"
-                          onclick="openModal('diff-<%= row_idx %>-<%= col_idx %>')">
+                          onclick="openModal('badge-<%= row_idx %>-<%= col_idx %>', 'diff-<%= row_idx %>-<%= col_idx %>')">
                       <%= STATUS_LABELS[status_str] || status_str.capitalize %>
                     </span>
                     <div id="diff-<%= row_idx %>-<%= col_idx %>" style="display:none"><%= CGI.escapeHTML(diff) %></div>
@@ -330,29 +369,82 @@ def generate_html(modules, stages, config)
 
       <div id="diffModal" class="modal">
         <div class="modal-content">
-          <span class="close" onclick="closeModal()">&times;</span>
-          <h3>Git Diff</h3>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h3 style="margin: 0;">Git Diff</h3>
+            <span class="close" onclick="closeModal()">&times;</span>
+          </div>
           <pre id="modalText"></pre>
+          <div class="modal-footer">
+            <button class="btn btn-primary" onclick="ignoreDiff()">Ignore diff</button>
+            <button class="btn btn-secondary" onclick="closeModal()">Ack diff</button>
+          </div>
         </div>
       </div>
 
       <script>
+        const STATUS_COLORS = <%= config['status_colors'].to_json %>;
         const modal = document.getElementById("diffModal");
         const modalText = document.getElementById("modalText");
+        let currentBadgeId = null;
 
-        function openModal(elementId) {
-          const diffContent = document.getElementById(elementId).textContent;
+        function openModal(badgeId, diffId) {
+          const diffContent = document.getElementById(diffId).textContent;
           modalText.textContent = diffContent;
+          currentBadgeId = badgeId;
           modal.style.display = "block";
         }
 
         function closeModal() {
           modal.style.display = "none";
+          currentBadgeId = null;
+        }
+
+        function ignoreDiff() {
+          if (!currentBadgeId) return;
+          
+          const badge = document.getElementById(currentBadgeId);
+          if (badge) {
+            // Update badge to Synced
+            badge.textContent = 'Synced';
+            badge.style.backgroundColor = STATUS_COLORS['synced'];
+            badge.classList.remove('clickable');
+            badge.removeAttribute('onclick');
+            
+            // Re-evaluate dimming for this row
+            // Find the parent TR
+            const td = badge.closest('td');
+            const tr = td.closest('tr');
+            if (tr) {
+              updateRowDimming(tr);
+            }
+          }
+          closeModal();
+        }
+
+        function updateRowDimming(tr) {
+          const badges = Array.from(tr.querySelectorAll('.status-badge'));
+          let isDimmed = false;
+
+          badges.forEach(badge => {
+            const td = badge.closest('td');
+            // Apply current dimmed state
+            if (isDimmed) {
+              td.classList.add('dimmed');
+            } else {
+              td.classList.remove('dimmed');
+            }
+
+            // Determine if NEXT cells should be dimmed
+            const statusText = badge.textContent.trim().toLowerCase();
+            if (['behind', 'diverged', 'error'].includes(statusText)) {
+              isDimmed = true;
+            }
+          });
         }
 
         window.onclick = function(event) {
           if (event.target == modal) {
-            modal.style.display = "none";
+            closeModal();
           }
         }
 
